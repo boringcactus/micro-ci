@@ -2,6 +2,7 @@ use std::process::Command;
 use std::path::PathBuf;
 use std::fs;
 use std::io;
+use std::time::{Instant, Duration};
 
 #[macro_use] extern crate log;
 
@@ -9,9 +10,11 @@ use uuid::Uuid;
 use hubcaps::{Credentials, Github, Future};
 use hubcaps::repositories::Repository;
 use hubcaps::statuses::{State, StatusOptions, Status};
-use hyper::rt::{self, Future as StdFuture};
+use hyper::rt::{Future as StdFuture};
 use hyper::client::HttpConnector;
 use hyper_tls::HttpsConnector;
+use tokio::prelude::*;
+use tokio::timer::Interval;
 
 // TODO make this configurable
 const LOG_DIR: &'static str = "/nfs/student/m/mhorn/public_html/ci/554-work";
@@ -45,7 +48,7 @@ fn get_repo() -> Repository<HttpsConnector<HttpConnector>> {
         Credentials::Token(env!("GITHUB_TOKEN").to_string()),
     );
     // TODO don't hard code to just be my repo
-    github.repo("boringcactus", "micro-ci")
+    github.repo("boringcactus", "cs554-work")
 }
 
 fn get_current_commit() -> String {
@@ -98,21 +101,54 @@ fn build_ci_status(result: Result<(bool, Uuid), io::Error>) -> (State, String, O
     }
 }
 
-fn run_everything() -> Future<()> {
+fn run_everything() -> Box<dyn StdFuture<Item = (), Error = ()> + Send> {
     let state = State::Pending;
     let description = "Running build".to_string();
     Box::new(push_ci_status(state, description, None).and_then(|_| {
         let result = run_ci();
         let (state, description, url) = build_ci_status(result);
         push_ci_status(state, description, url).map(|_| ())
-    }))
+    }).map_err(|err| eprintln!("Encountered error: {}", err)))
+}
+
+fn pull_if_needed() -> Result<bool, String> {
+    let fetch = Command::new("git")
+        .arg("fetch")
+        .status()
+        .map_err(|e| format!("failed to git fetch: {}", e))?;
+    if fetch.success() {
+        let local = get_current_commit();
+        let remote = {
+            let out = Command::new("git")
+                .arg("rev-parse")
+                .arg("@{u}")
+                .output()
+                .expect("Failed to check for new git commit")
+                .stdout;
+            String::from_utf8(out).expect("invalid utf-8").trim().to_string()
+        };
+        if local == remote {
+            return Ok(false);
+        }
+        let pull = Command::new("git").arg("pull").status();
+        pull.map(|_| true).map_err(|e| format!("Failed to git pull: {}", e))
+    } else {
+        Err("Could not git fetch".to_string())
+    }
 }
 
 fn main() {
     env_logger::init();
 
-    rt::run(rt::lazy(|| {
-        run_everything()
-            .map_err(|err| eprintln!("{}", err))
-    }));
+    let interval = Interval::new(Instant::now(), Duration::from_secs(60))
+        .map_err(|err| eprintln!("Interval error: {}", err))
+        .for_each(|_| {
+            if let Ok(true) = pull_if_needed() {
+                println!("Change caught, running tests");
+                tokio::spawn(run_everything());
+            }
+            Ok(())
+        });
+
+    tokio::run(interval);
 }
