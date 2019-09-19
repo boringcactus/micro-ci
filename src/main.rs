@@ -1,7 +1,8 @@
-use std::process::Command;
+use std::process::{self, Command};
 use std::path::PathBuf;
 use std::fs;
 use std::io;
+use std::env;
 use std::time::{Instant, Duration};
 
 #[macro_use] extern crate log;
@@ -15,23 +16,83 @@ use hyper::client::HttpConnector;
 use hyper_tls::HttpsConnector;
 use tokio::prelude::*;
 use tokio::timer::Interval;
+use serde::Deserialize;
 
-// TODO make this configurable
-const LOG_DIR: &'static str = "/nfs/student/m/mhorn/public_html/ci/554-work";
-const URL_ROOT: &'static str = "https://www.cs.unm.edu/~mhorn/ci/554-work/";
+fn get_config<'a, 'de, T: Deserialize<'de>>(config_path: PathBuf, path_type: &'a str) -> T {
+    let display_path = config_path.display();
+    if !config_path.is_file() {
+        eprintln!("No {} config file found at {}", path_type, display_path);
+        process::exit(1);
+    }
+    let config_data = fs::read(&config_path);
+    let config_data = match config_data {
+        Ok(data) => data,
+        Err(err) => {
+            eprintln!("Failed to read {} config file {}: {}", path_type, display_path, err);
+            process::exit(1);
+        }
+    };
+    let config_raw: Result<toml::Value, _> = toml::from_slice(&config_data);
+    let config_raw = match config_raw {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("Failed to parse {} config file {}: {}", path_type, display_path, err);
+            process::exit(1);
+        }
+    };
+    match config_raw.try_into() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("Failed to parse {} config file {}: {}", path_type, display_path, err);
+            process::exit(1);
+        }
+    }
+}
 
-fn run_ci() -> Result<(bool, Uuid), io::Error> {
-    // TODO make this configurable
+/// Global settings
+#[derive(Deserialize)]
+struct GlobalConfig {
+    github_token: String,
+    web_root_path: PathBuf,
+    web_root_url: String,
+    fetch_interval: u64,
+}
+
+fn get_global_config() -> GlobalConfig {
+    let mut config_path = dirs::config_dir().expect("Could not find user config directory");
+    config_path.push("micro-ci-global.toml");
+    get_config(config_path, "global")
+}
+
+/// Local settings
+#[derive(Deserialize)]
+struct LocalConfig {
+    github_repo: String,
+    command: String,
+}
+
+fn get_local_config() -> LocalConfig {
+    let config_path = PathBuf::from(".micro-ci.toml");
+    get_config(config_path, "local")
+}
+
+fn run_ci(gconfig: &GlobalConfig, lconfig: &LocalConfig) -> Result<(bool, Uuid), io::Error> {
     let command = Command::new("bash")
         .arg("-c")
-        .arg("cargo test 2>&1")
+        .arg(format!("{} 2>&1", &lconfig.command))
         .output()?;
 
     let out_text = String::from_utf8(command.stdout).expect("invalid utf-8");
     let status = command.status;
     
     let run_id = Uuid::new_v4();
-    let run_path: PathBuf = [LOG_DIR, &format!("{}.txt", run_id)].iter().collect();
+    let run_path: PathBuf = {
+        let mut result = gconfig.web_root_path.clone();
+        result.push(&lconfig.github_repo);
+        fs::create_dir_all(&result)?;
+        result.push(&format!("{}.txt", run_id));
+        result
+    };
     
     let status_code = status.code()
         .map(|x| format!("{}", x))
@@ -41,14 +102,16 @@ fn run_ci() -> Result<(bool, Uuid), io::Error> {
     Ok((status.success(), run_id))
 }
 
-fn get_repo() -> Repository<HttpsConnector<HttpConnector>> {
+fn get_repo(gconfig: &GlobalConfig, lconfig: &LocalConfig)
+    -> Repository<HttpsConnector<HttpConnector>> {
     let github = Github::new(
         format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
-        // TODO fetch this at runtime, not build time
-        Credentials::Token(env!("GITHUB_TOKEN").to_string()),
+        Credentials::Token(gconfig.github_token.clone()),
     );
-    // TODO don't hard code to just be my repo
-    github.repo("boringcactus", "cs554-work")
+    let pieces = lconfig.github_repo.split("/").collect::<Vec<_>>();
+    let user = pieces[0];
+    let repo = pieces[1];
+    github.repo(user, repo)
 }
 
 fn get_current_commit() -> String {
@@ -62,14 +125,15 @@ fn get_current_commit() -> String {
     // TODO validate output
 }
 
-fn push_ci_status(state: State, description: String, url: Option<String>) -> Future<Status> {
+fn push_ci_status(gconfig: &GlobalConfig, lconfig: &LocalConfig,
+    state: State, description: String, url: Option<String>) -> Future<Status> {
     debug!("Pushing {:?}", (&state, &description, &url));
     let mut options = StatusOptions::builder(state);
     options.description(description);
     let url = url.unwrap_or_else(|| "https://example.com".to_string());
     options.target_url(url);
     let options = options.build();
-    let repo = get_repo();
+    let repo = get_repo(gconfig, lconfig);
     let statuses = repo.statuses();
     Box::new(statuses.create(&get_current_commit(), &options)
         .map(|x| {
@@ -81,17 +145,19 @@ fn push_ci_status(state: State, description: String, url: Option<String>) -> Fut
         }))
 }
 
-fn build_ci_status(result: Result<(bool, Uuid), io::Error>) -> (State, String, Option<String>) {
+fn build_ci_status(gconfig: &GlobalConfig, lconfig: &LocalConfig,
+    result: Result<(bool, Uuid), io::Error>) -> (State, String, Option<String>) {
+    let url_root = format!("{}/{}", &gconfig.web_root_url, &lconfig.github_repo);
     match result {
         Ok((true, id)) => (
             State::Success,
             "Build completed successfully".to_string(),
-            Some(format!("{}{}.txt", URL_ROOT, id)),
+            Some(format!("{}/{}.txt", url_root, id)),
         ),
         Ok((false, id)) => (
             State::Failure,
             "Build did not complete successfully".to_string(),
-            Some(format!("{}{}.txt", URL_ROOT, id)),
+            Some(format!("{}/{}.txt", url_root, id)),
         ),
         Err(e) => (
             State::Error,
@@ -104,10 +170,12 @@ fn build_ci_status(result: Result<(bool, Uuid), io::Error>) -> (State, String, O
 fn run_everything() -> Box<dyn StdFuture<Item = (), Error = ()> + Send> {
     let state = State::Pending;
     let description = "Running build".to_string();
-    Box::new(push_ci_status(state, description, None).and_then(|_| {
-        let result = run_ci();
-        let (state, description, url) = build_ci_status(result);
-        push_ci_status(state, description, url).map(|_| ())
+    let gconfig = get_global_config();
+    let lconfig = get_local_config();
+    Box::new(push_ci_status(&gconfig, &lconfig, state, description, None).and_then(move |_| {
+        let result = run_ci(&gconfig, &lconfig);
+        let (state, description, url) = build_ci_status(&gconfig, &lconfig, result);
+        push_ci_status(&gconfig, &lconfig, state, description, url).map(|_| ())
     }).map_err(|err| eprintln!("Encountered error: {}", err)))
 }
 
@@ -139,11 +207,15 @@ fn pull_if_needed() -> Result<bool, String> {
 
 fn main() {
     env_logger::init();
+    let gconfig = get_global_config();
+    let _lconfig = get_local_config();
+    let has_run_now = env::args().any(|x| x == "--run-now");
+    let mut should_run_now = if has_run_now { Some(()) } else { None };
 
-    let interval = Interval::new(Instant::now(), Duration::from_secs(60))
+    let interval = Interval::new(Instant::now(), Duration::from_secs(gconfig.fetch_interval))
         .map_err(|err| eprintln!("Interval error: {}", err))
-        .for_each(|_| {
-            if let Ok(true) = pull_if_needed() {
+        .for_each(move |_| {
+            if should_run_now.take().is_some() || pull_if_needed() == Ok(true) {
                 println!("Change caught, running tests");
                 tokio::spawn(run_everything());
             }

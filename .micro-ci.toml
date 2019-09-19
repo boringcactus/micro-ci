@@ -1,0 +1,2 @@
+github_repo = "boringcactus/micro-ci"
+command = "cargo test"

@@ -14,3 +14,6 @@ hyper-tls = "0.3"
 log = "0.4.8"
 env_logger = "0.6.2"
 tokio = "0.1.22"
+serde = { version = "1.0.101", features = ["derive"] }
+toml = "0.5.3"
+dirs = "2.0.2"
