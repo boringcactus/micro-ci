@@ -10,6 +10,11 @@ keywords = ["CI", "ci", "continuous integration"]
 categories = ["development-tools"]
 license = "MIT"
 maintenance = { status = "experimental" }
+include = [
+    "**/*.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
