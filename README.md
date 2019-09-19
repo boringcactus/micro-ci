@@ -2,8 +2,6 @@
 
 Tiny self-hosted CI with minimal requirements.
 
-**IMPORTANT:** All of the following is planned; none of this actually works this way yet.
-
 ## Installation
 
 `cargo install micro-ci` or yoink a Linux binary of the
