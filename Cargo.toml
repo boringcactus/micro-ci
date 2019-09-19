@@ -6,7 +6,7 @@ authors = ["Melody Horn <melody@boringcactus.com>"]
 description = "Tiny self-hosted CI with minimal requirements"
 repository = "https://github.com/boringcactus/micro-ci"
 readme = "README.md"
-keywords = ["CI", "ci", "continuous integration"]
+keywords = ["CI", "ci", "continuous-integration"]
 categories = ["development-tools"]
 license = "MIT"
 maintenance = { status = "experimental" }
