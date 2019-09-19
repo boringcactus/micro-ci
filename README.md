@@ -42,3 +42,4 @@ For each repository you want to use micro-ci to test:
 - Check out the branch you want to run tests on
 - Run `micro-ci` in the folder where `.micro-ci.toml` lives and your test script should be run
 - To make `micro-ci` always run tests on the current commit, run `micro-ci --run-now`
+- For verbose logging if something's broken, set `RUST_LOG=micro_ci=debug`

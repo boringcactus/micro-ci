@@ -1,4 +1,4 @@
-use std::process::{self, Command};
+use std::process::{self, Command, Stdio};
 use std::path::PathBuf;
 use std::fs;
 use std::io;
@@ -77,6 +77,7 @@ fn get_local_config() -> LocalConfig {
 }
 
 fn run_ci(gconfig: &GlobalConfig, lconfig: &LocalConfig) -> Result<(bool, Uuid), io::Error> {
+    info!("Starting to run CI");
     let command = Command::new("bash")
         .arg("-c")
         .arg(format!("{} 2>&1", &lconfig.command))
@@ -97,7 +98,9 @@ fn run_ci(gconfig: &GlobalConfig, lconfig: &LocalConfig) -> Result<(bool, Uuid),
     let status_code = status.code()
         .map(|x| format!("{}", x))
         .unwrap_or(String::from("???"));
-    let final_result = format!("{}\n\nBuild exited with code {}\n", out_text, status_code);
+    let status_description = format!("Build exited with code {}", status_code);
+    info!("{}", &status_description);
+    let final_result = format!("{}\n\n{}\n", out_text, status_description);
     fs::write(&run_path, &final_result)?;
     Ok((status.success(), run_id))
 }
@@ -137,7 +140,7 @@ fn push_ci_status(gconfig: &GlobalConfig, lconfig: &LocalConfig,
     let statuses = repo.statuses();
     Box::new(statuses.create(&get_current_commit(), &options)
         .map(|x| {
-            debug!("Got status: {:?}", &x);
+            debug!("Got status with state {:?}", &x.state);
             x
         }).map_err(|err| {
             error!("Got error when creating status: {:?}", &err);
@@ -180,8 +183,11 @@ fn run_everything() -> Box<dyn StdFuture<Item = (), Error = ()> + Send> {
 }
 
 fn pull_if_needed() -> Result<bool, String> {
+    debug!("Fetching");
     let fetch = Command::new("git")
         .arg("fetch")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map_err(|e| format!("failed to git fetch: {}", e))?;
     if fetch.success() {
@@ -196,9 +202,15 @@ fn pull_if_needed() -> Result<bool, String> {
             String::from_utf8(out).expect("invalid utf-8").trim().to_string()
         };
         if local == remote {
+            debug!("Already up-to-date, not pulling");
             return Ok(false);
         }
-        let pull = Command::new("git").arg("pull").status();
+        debug!("Pulling");
+        let pull = Command::new("git")
+            .arg("pull")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         pull.map(|_| true).map_err(|e| format!("Failed to git pull: {}", e))
     } else {
         Err("Could not git fetch".to_string())
@@ -215,8 +227,20 @@ fn main() {
     let interval = Interval::new(Instant::now(), Duration::from_secs(gconfig.fetch_interval))
         .map_err(|err| eprintln!("Interval error: {}", err))
         .for_each(move |_| {
-            if should_run_now.take().is_some() || pull_if_needed() == Ok(true) {
-                println!("Change caught, running tests");
+            let test = match should_run_now.take() {
+                Some(()) => {
+                    info!("Forced to run from command line");
+                    true
+                }
+                None => match pull_if_needed() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        error!("Error while pulling: {}", e);
+                        false
+                    }
+                }
+            };
+            if test {
                 tokio::spawn(run_everything());
             }
             Ok(())
